@@ -10,32 +10,53 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Service {
-  id          String         @id @default(cuid())
-  name        String
-  baseUrl     String
-  description String?
-  createdAt   DateTime       @default(now())
-  updatedAt   DateTime       @updatedAt
+// Seed configuration
+// Run with: npx prisma db seed
+// or: npm run db:seed
 
-  apiSpecs    ApiSpec[]
+// ============================================================================
+// CORE ENTITIES (Enhanced)
+// ============================================================================
+
+model Service {
+  id             String         @id @default(cuid())
+  name           String
+  baseUrl        String
+  description    String?
+  healthCheckUrl String?
+  metadata       String?        @db.Text // JSON for custom metadata
+  isActive       Boolean        @default(true)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  deletedAt      DateTime?      // Soft delete
+
+  apiSpecs       ApiSpec[]
   contractSuites ContractSuite[]
+  environments   TestEnvironment[]
+  tags           ServiceTag[]
 
   @@map("services")
+  @@index([isActive])
 }
 
 model ApiSpec {
-  id        String   @id @default(cuid())
-  serviceId String
-  version   String
-  format    SpecFormat
-  rawText   String   @db.Text
-  createdAt DateTime @default(now())
+  id          String     @id @default(cuid())
+  serviceId   String
+  version     String
+  format      SpecFormat
+  rawText     String     @db.Text
+  parsedData  String?    @db.Text // Cached parsed OpenAPI data
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  deletedAt   DateTime?
 
-  service   Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  service     Service    @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  diffs       SpecDiff[] @relation("NewSpec")
+  diffsOld    SpecDiff[] @relation("OldSpec")
 
   @@map("api_specs")
   @@index([serviceId])
+  @@index([version])
 }
 
 model ContractSuite {
@@ -44,30 +65,158 @@ model ContractSuite {
   name        String
   description String?
   configJson  String   @db.Text // JSON stringified config
+  schedule    String?  // Cron expression for scheduled runs
+  enabled     Boolean  @default(true)
+  retryConfig String?  @db.Text // JSON for retry configuration
+  templateId  String?  // Reference to test template
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  deletedAt   DateTime?
+
+  service     Service       @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  template    TestTemplate? @relation(fields: [templateId], references: [id])
+  runs        ContractRun[]
+  tags        SuiteTag[]
+  assertions  CustomAssertion[]
+
+  @@map("contract_suites")
+  @@index([serviceId])
+  @@index([enabled])
+}
+
+model ContractRun {
+  id                 String         @id @default(cuid())
+  suiteId            String
+  environmentId      String?
+  startedAt          DateTime
+  finishedAt         DateTime?
+  status             RunStatus
+  summaryJson        String?        @db.Text // JSON stringified summary
+  performanceMetrics String?        @db.Text // JSON for performance data
+  logPath            String?
+  artifactsPath      String?        // Path to stored artifacts
+  triggeredBy        String?        // 'manual', 'schedule', 'api', 'webhook'
+  triggerMetadata    String?        @db.Text // JSON for trigger details
+
+  suite              ContractSuite  @relation(fields: [suiteId], references: [id], onDelete: Cascade)
+  environment        TestEnvironment? @relation(fields: [environmentId], references: [id])
+
+  @@map("contract_runs")
+  @@index([suiteId])
+  @@index([status])
+  @@index([startedAt])
+}
+
+// ============================================================================
+// NEW ENTITIES
+// ============================================================================
+
+model TestEnvironment {
+  id          String   @id @default(cuid())
+  serviceId   String
+  name        String   // e.g., "development", "staging", "production"
+  baseUrl     String   // Override service baseUrl for this environment
+  description String?
+  config      String?  @db.Text // JSON for environment-specific config
+  isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   service     Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
   runs        ContractRun[]
 
-  @@map("contract_suites")
+  @@map("test_environments")
   @@index([serviceId])
+  @@unique([serviceId, name])
 }
 
-model ContractRun {
+model TestTemplate {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  strategy    String   // e.g., "simple-get", "authenticated", "full-crud"
+  template    String   @db.Text // Template code for test generation
+  config      String?  @db.Text // JSON configuration
+  isBuiltIn   Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  suites      ContractSuite[]
+
+  @@map("test_templates")
+}
+
+model CustomAssertion {
   id          String   @id @default(cuid())
   suiteId     String
-  startedAt   DateTime
-  finishedAt  DateTime?
-  status      RunStatus
-  summaryJson String?  @db.Text // JSON stringified summary
-  logPath     String?
+  name        String
+  type        AssertionType
+  config      String   @db.Text // JSON configuration for the assertion
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   suite       ContractSuite @relation(fields: [suiteId], references: [id], onDelete: Cascade)
 
-  @@map("contract_runs")
+  @@map("custom_assertions")
   @@index([suiteId])
 }
+
+model SpecDiff {
+  id          String   @id @default(cuid())
+  oldSpecId   String
+  newSpecId   String
+  diffData    String   @db.Text // JSON containing the diff
+  breakingChanges String @db.Text // JSON array of breaking changes
+  createdAt   DateTime @default(now())
+
+  oldSpec     ApiSpec  @relation("OldSpec", fields: [oldSpecId], references: [id], onDelete: Cascade)
+  newSpec     ApiSpec  @relation("NewSpec", fields: [newSpecId], references: [id], onDelete: Cascade)
+
+  @@map("spec_diffs")
+  @@index([oldSpecId])
+  @@index([newSpecId])
+}
+
+model Tag {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  color       String?  // Hex color code
+  description String?
+  createdAt   DateTime @default(now())
+
+  services    ServiceTag[]
+  suites      SuiteTag[]
+
+  @@map("tags")
+}
+
+// Join tables for many-to-many relationships
+model ServiceTag {
+  serviceId   String
+  tagId       String
+
+  service     Service  @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  tag         Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([serviceId, tagId])
+  @@map("service_tags")
+}
+
+model SuiteTag {
+  suiteId     String
+  tagId       String
+
+  suite       ContractSuite @relation(fields: [suiteId], references: [id], onDelete: Cascade)
+  tag         Tag      @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([suiteId, tagId])
+  @@map("suite_tags")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
 
 enum SpecFormat {
   OPENAPI_JSON
@@ -79,4 +228,13 @@ enum RunStatus {
   PASSED
   FAILED
   ERROR
+  CANCELLED
+}
+
+enum AssertionType {
+  STATUS_CODE
+  RESPONSE_SCHEMA
+  RESPONSE_TIME
+  HEADER_PRESENT
+  CUSTOM_SCRIPT
 }
